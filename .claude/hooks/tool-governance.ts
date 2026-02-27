@@ -182,17 +182,54 @@ const SECURITY_TIERS: Record<string, SecurityTier> = {
     message: 'BLOCKED: git clean -f permanently deletes untracked files. Run manually if intended.'
   },
 
-  // Tier 9: Kubernetes destructive - Block
-  kubernetesDestructive: {
+  // Tier 9: Azure network infrastructure - Block
+  // VNet/peering/DNS changes cascade and can break cross-VNet connectivity
+  azureNetworkDestructive: {
     patterns: [
-      /^\s*(?:sudo\s+)?kubectl\b.*\bdelete\b/i,
-      /^\s*(?:sudo\s+)?kubectl\b.*\bpatch\b/i,
+      /^\s*az\s+network\s+vnet\s+peering\s+delete\b/i,
+      /^\s*az\s+network\s+vnet\s+delete\b/i,
+      /^\s*az\s+network\s+vnet\s+subnet\s+delete\b/i,
+      /^\s*az\s+network\s+nsg\s+delete\b/i,
+      /^\s*az\s+network\s+private-dns\s+zone\s+delete\b/i,
+      /^\s*az\s+network\s+private-endpoint\s+delete\b/i,
+      /^\s*az\s+network\s+route-table\s+delete\b/i,
     ],
     action: 'block',
-    message: 'BLOCKED: kubectl delete/patch can modify or destroy resources. Run manually if intended.'
+    message: 'BLOCKED: Azure network infrastructure deletion. VNet/peering/DNS changes cascade and can break connectivity. Run manually if intended.'
   },
 
-  // Tier 10: Terraform/Tofu destructive - Block
+  // Tier 9.5: Azure CLI destructive - Block
+  // Catch-all: any `az ... delete` or `az ... purge` plus specific destructive commands
+  azureDestructive: {
+    patterns: [
+      /^\s*az\s+.*\bdelete\b/i,
+      /^\s*az\s+.*\bpurge\b/i,
+      /^\s*az\s+aks\s+stop\b/i,
+      /^\s*az\s+ad\s+app\s+delete\b/i,
+      /^\s*az\s+ad\s+sp\s+delete\b/i,
+      /^\s*az\s+role\s+assignment\s+delete\b/i,
+      /^\s*az\s+storage\s+blob\s+delete-batch\b/i,
+    ],
+    action: 'block',
+    message: 'BLOCKED: Azure CLI destructive operation. Run manually if intended.'
+  },
+
+  // Tier 10: Kubernetes destructive - Block
+  // Anchored to segment start (after && split) with optional sudo
+  // Uses negative lookbehind (?<!-) to exclude flags like --delete-emptydir-data
+  kubernetesDestructive: {
+    patterns: [
+      /^\s*(?:sudo\s+)?kubectl\b.*(?<!-)\bdelete\b/i,
+      /^\s*(?:sudo\s+)?kubectl\b.*(?<!-)\bpatch\b/i,
+      /^\s*(?:sudo\s+)?kubectl\b.*\bapply\b/i,
+      /^\s*(?:sudo\s+)?kubectl\b.*\bedit\b/i,
+      /^\s*(?:sudo\s+)?kubectl\b.*\breplace\b.*--force/i,
+    ],
+    action: 'block',
+    message: 'BLOCKED: kubectl delete/patch/apply/edit/replace --force can modify or destroy resources. Use GitOps or run manually if intended.'
+  },
+
+  // Tier 11: Terraform/Tofu destructive - Block
   terraformDestructive: {
     patterns: [
       /^\s*(?:sudo\s+)?terraform\b.*\bdestroy\b/i,
@@ -358,6 +395,68 @@ function extractCdDirectory(command: string): string | null {
   return dir;
 }
 
+/**
+ * Normalize a git command by stripping global options between 'git' and the subcommand.
+ *
+ * Git allows global flags like -C <path>, -c <key=value>, --no-pager before the
+ * subcommand. These break naive regexes that expect "git push" or "git commit"
+ * with nothing in between.
+ *
+ * Returns the command rewritten as if those flags weren't there, plus any -C path
+ * found (for use as cwd in getGitContext).
+ *
+ * Example: "git -C /Users/me/repo push origin main" -> { normalized: "git push origin main", gitCwd: "/Users/me/repo" }
+ */
+function normalizeGitCommand(command: string): { normalized: string; gitCwd: string | null } {
+  // Match the git prefix (optional sudo) followed by global options
+  const gitPrefix = command.match(/^(\s*(?:sudo\s+)?git)\s+/);
+  if (!gitPrefix) return { normalized: command, gitCwd: null };
+
+  const prefix = gitPrefix[1];
+  let rest = command.slice(gitPrefix[0].length);
+  let gitCwd: string | null = null;
+
+  // Consume global options that appear before the subcommand
+  while (rest.length > 0) {
+    // -C <path> (working directory override)
+    const cMatch = rest.match(/^-C\s+("[^"]+"|'[^']+'|\S+)\s*/);
+    if (cMatch) {
+      gitCwd = cMatch[1].replace(/^["']|["']$/g, '');
+      if (gitCwd.startsWith('~')) {
+        gitCwd = gitCwd.replace('~', process.env.HOME || '');
+      }
+      rest = rest.slice(cMatch[0].length);
+      continue;
+    }
+
+    // -c <key=value> (config override)
+    const configMatch = rest.match(/^-c\s+\S+\s*/);
+    if (configMatch) {
+      rest = rest.slice(configMatch[0].length);
+      continue;
+    }
+
+    // Boolean global flags
+    const flagMatch = rest.match(/^--(?:no-pager|no-replace-objects|bare|literal-pathspecs|glob-pathspecs|noglob-pathspecs|no-optional-locks)\s*/);
+    if (flagMatch) {
+      rest = rest.slice(flagMatch[0].length);
+      continue;
+    }
+
+    // --git-dir=<path>, --work-tree=<path>, --namespace=<name>
+    const eqMatch = rest.match(/^--(?:git-dir|work-tree|namespace)=\S+\s*/);
+    if (eqMatch) {
+      rest = rest.slice(eqMatch[0].length);
+      continue;
+    }
+
+    // No more global options - rest starts with the subcommand
+    break;
+  }
+
+  return { normalized: `${prefix} ${rest}`, gitCwd };
+}
+
 function getGitContext(cwd?: string): GitContext {
   try {
     const options: { stdout: 'pipe'; stderr: 'pipe'; cwd?: string } = {
@@ -497,12 +596,16 @@ async function main() {
       const command = hookData.tool_input?.command as string;
 
       if (command) {
+        // Normalize git commands to strip global flags (-C, -c, --no-pager, etc.)
+        // so regexes that expect "git push" or "git commit" work correctly.
+        const { normalized: normalizedCmd, gitCwd: gitFlagCwd } = normalizeGitCommand(command);
+
         // CUSTOMIZE: Check if this is a git commit in repos that should be exempt
-        const isGitCommit = /\bgit\s+commit\b/i.test(command);
+        const isGitCommit = /\bgit\s+commit\b/i.test(normalizedCmd);
         let skipGitEnforcement = false;
 
         if (isGitCommit) {
-          const cmdCwd = extractCdDirectory(command);
+          const cmdCwd = gitFlagCwd || extractCdDirectory(command);
           const gitContext = getGitContext(cmdCwd || undefined);
 
           if (gitContext.isDotfilesRepo) {
@@ -511,7 +614,8 @@ async function main() {
           }
         }
 
-        const validation = validateCommand(command);
+        // Validate the normalized command against security tiers
+        const validation = validateCommand(normalizedCmd);
 
         if (!validation.allowed) {
           // Skip git signing/format enforcement for exempt repos
@@ -526,12 +630,12 @@ async function main() {
         }
 
         // Block direct push to main/master in non-dotfiles repos
-        if (/git\s+push/.test(command)) {
-          const explicitMainPush = /git\s+push\s+\S+\s+(main|master)\b/i.test(command);
-          const barePush = /git\s+push\s*$/.test(command) || /git\s+push\s+origin\s*$/.test(command);
+        if (/git\s+push/.test(normalizedCmd)) {
+          const explicitMainPush = /git\s+push\s+\S+\s+(main|master)\b/i.test(normalizedCmd);
+          const barePush = /git\s+push\s*$/.test(normalizedCmd) || /git\s+push\s+origin\s*$/.test(normalizedCmd);
 
           if (explicitMainPush || barePush) {
-            const cmdCwd = extractCdDirectory(command);
+            const cmdCwd = gitFlagCwd || extractCdDirectory(command);
             const gitContext = getGitContext(cmdCwd || undefined);
 
             // Allow dotfiles repos to push to main
